@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Public X / Truth Social post → dark bilingual share card + chat body.
+Agent translates; this fetches public data and renders. Same layout for both;
+only corner logo, verify mark, affiliation square, link color, and canonical URL change.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import html
+import json
+import re
+import math
+import subprocess
+import sys
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+FX = "https://api.fxtwitter.com"
+BJ = timezone(timedelta(hours=8))
+LOCAL = ZoneInfo("America/Los_Angeles")  # card timestamps: original local, not Beijing
+ASSETS = Path(__file__).resolve().parent / "assets"
+EPOCH = 1288834974657
+URL_RE = re.compile(r"(?:https?://)?(?:www\.)?(?:x|twitter)\.com/([^/]+)/status/(\d+)", re.I)
+MEDIA_URL_RE = re.compile(
+    r"\s*https://(?:x|twitter)\.com/\S+/status/\d+/(?:photo|video|media)/\d+\S*",
+    re.I,
+)
+STATUS_RE = re.compile(r"/([^/\s]+)/status/(\d{15,})")
+# Truth Social: /@HANDLE/posts/ID | /@HANDLE/ID | /users/HANDLE/statuses/ID
+TS_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?truthsocial\.com/"
+    r"(?:@|users/)([^/]+)/(?:posts/|statuses/)?(\d{10,})",
+    re.I,
+)
+TS_API = "https://truthsocial.com/api/v1"
+TS_ARCHIVE = "https://trumpstruth.org"
+TS_FEED = "https://trumpstruth.org/feed"
+# Official TS marks from the live site (not invented). Empty if a download fails.
+TS_LOGO_CANDIDATES = (
+    "https://truthsocial.com/apple-touch-icon.png",
+    "https://truthsocial.com/android-chrome-192x192.png",
+    "https://truthsocial.com/icons/icon-192x192.png",
+    "https://static-assets-1.truthsocial.com/tmtg:prime-ts-assets/site_uploads/files/000/000/035/original/Truth_Social_Profile_Icon.png",
+    "https://truthsocial.com/favicon.png",
+)
+TS_VERIFY_CANDIDATES = (
+    # Live webpack pack: official red verified mark (speech-check used on TS).
+    "https://truthsocial.com/packs/media/images/icons/verified_1-bc97ae63a3e3b44c83ec2d617c764a3e.svg",
+    "https://truthsocial.com/packs/media/images/icons/verified_1.svg",
+)
+# Known trumpstruth.org archive page for a TS status id (keep going if missing).
+TS_ARCHIVE_KNOWN = {
+    "117175567133618204": "https://trumpstruth.org/statuses/41356",
+    "117176514317841811": "https://trumpstruth.org/statuses/41360",
+}
