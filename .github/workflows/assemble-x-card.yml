@@ -12,9 +12,19 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Concatenate parts
+      - name: Concatenate parts when complete
         run: |
-          python3 -c "from pathlib import Path; ps=sorted(Path('_parts').glob('p*.txt')); Path('x_card.py').write_text(''.join(p.read_text(encoding='utf-8') for p in ps), encoding='utf-8')"
+          python3 - <<'PY'
+          from pathlib import Path
+          ps = sorted(Path('_parts').glob('p*.txt'))
+          print('parts', [p.name for p in ps])
+          if len(ps) < 9:
+              print('not ready')
+              raise SystemExit(0)
+          Path('x_card.py').write_text(''.join(p.read_text(encoding='utf-8') for p in ps), encoding='utf-8')
+          print('wrote', Path('x_card.py').stat().st_size)
+          PY
+          if [ ! -f x_card.py ]; then exit 0; fi
           rm -rf _parts
           git config user.name grokbotx
           git config user.email grokbots@agent.qq.com
