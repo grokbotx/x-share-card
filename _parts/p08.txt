@@ -1,0 +1,9 @@
+ platform")
+    t.set_defaults(func=cmd_timeline)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
