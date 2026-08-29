@@ -643,6 +643,16 @@ def snowflake_dt(sid: str) -> datetime:
     return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
 
 
+def is_x_snowflake(sid: str) -> bool:
+    """True only for Twitter snowflakes. Truth Social / Mastodon ids fail."""
+    if not sid.isdigit() or not (18 <= len(sid) <= 19):
+        return False
+    ts_ms = (int(sid) >> 22) + EPOCH
+    min_ms = 1356998400000  # ~2013-01-01
+    now_ms = datetime.now(timezone.utc).timestamp() * 1000
+    return min_ms <= ts_ms <= now_ms + 86400000
+
+
 def parse_created(s: str | None, fallback_id: str, platform: str = "x") -> datetime:
     if s:
         for fmt in ("%a %b %d %H:%M:%S %z %Y", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
@@ -1452,10 +1462,12 @@ def cmd_timeline(args: argparse.Namespace) -> None:
         for s in new:
             print(f"{s}\t{canonical_url('truthsocial', handle, s)}")
         return
-    ids = timeline_xtracker(handle)
+    # Same path as elonmusk: XTracker first, then x.com HTML.
+    # XTracker maps realDonaldTrump to Truth Social; those ids must not count as X.
+    ids = [s for s in (timeline_xtracker(handle) or []) if is_x_snowflake(s)]
     if not ids:
         try:
-            ids = timeline_xhtml(handle)
+            ids = [s for s in timeline_xhtml(handle) if is_x_snowflake(s)]
         except Exception as e:
             die(f"FAIL timeline: {e}")
     if not ids:
