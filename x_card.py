@@ -125,6 +125,19 @@ img.xlogo { border-radius:6px; background:transparent; }
   display:flex; align-items:center; justify-content:center;
 }
 .play svg { margin-left:4px; }
+/* third layer: a quote inside the quote — same language, one size down */
+.nquote { border:1px solid #2f3336; border-radius:14px; padding:10px; margin-top:8px; }
+.nqtop { display:flex; align-items:center; gap:5px; flex-wrap:wrap; }
+.nqavatar { width:16px; height:16px; border-radius:50%; object-fit:cover; flex-shrink:0; }
+.nqname { font-weight:700; font-size:13px; color:#e7e9ea; }
+.nqhandle { color:#71767b; font-size:13px; }
+.nqtext { font-size:14px; line-height:19px; margin-top:5px; color:#e7e9ea;
+  white-space:pre-wrap; word-wrap:break-word; overflow-wrap:anywhere; }
+.nzh-box { font-size:13px; line-height:19px; margin:6px 0 4px; padding:8px 10px; border-radius:9px; }
+.nzh-box .zh-time { font-size:12px; }
+.nmedia { margin-top:8px; display:flex; flex-direction:column; gap:6px; }
+.nmedia img { width:100%; height:auto; border-radius:10px; display:block; background:#16181c; }
+.nmedia .vidwrap img { border-radius:10px; }
 """
 
 
@@ -212,26 +225,31 @@ def download_fresh(url: str, dest: Path, timeout: int = 120) -> bool:
         return False
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
-        data = get(url, timeout=timeout)
+        data = get(url, timeout=min(timeout, 20))
         if looks_like_image(data):
             dest.write_bytes(data)
             return dest.stat().st_size > 80
         print(f"warn: not an image {url[:80]}", file=sys.stderr)
     except Exception as e:
         print(f"warn: download failed {url[:80]} ({e})", file=sys.stderr)
-    try:
-        r = subprocess.run(
-            ["curl", "-sS", "-L", "--max-time", str(int(timeout)), "-A", UA,
-             "-H", "Accept: image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-             "-o", str(dest), url],
-            capture_output=True, timeout=timeout + 8,
-        )
-        if r.returncode == 0 and dest.exists() and looks_like_image(dest.read_bytes()):
-            return True
-        if dest.exists() and not looks_like_image(dest.read_bytes()):
-            dest.unlink(missing_ok=True)
-    except Exception as e:
-        print(f"warn: curl failed {url[:80]} ({e})", file=sys.stderr)
+    curl_t = str(int(timeout))
+    for attempt in range(3):
+        try:
+            r = subprocess.run(
+                ["curl", "-sS", "-f", "-L", "--retry", "2", "--retry-delay", "1",
+                 "--max-time", curl_t, "-A", UA,
+                 "-H", "Accept: image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                 "-o", str(dest), url],
+                capture_output=True, timeout=timeout + 12,
+            )
+            if r.returncode == 0 and dest.exists() and looks_like_image(dest.read_bytes()):
+                return True
+            if dest.exists() and not looks_like_image(dest.read_bytes()):
+                dest.unlink(missing_ok=True)
+            err = (r.stderr or b"").decode("utf-8", "ignore").strip()
+            print(f"warn: curl try {attempt+1} {url[:80]} rc={r.returncode} {err[:80]}", file=sys.stderr)
+        except Exception as e:
+            print(f"warn: curl failed {url[:80]} ({e})", file=sys.stderr)
     return False
 
 
@@ -486,7 +504,9 @@ def ts_feed_ids(handle: str) -> list[str]:
     return ids
 
 
-def save_ts_media(st: dict, media_dir: Path, prefix: str) -> tuple[list[str], str | None, str | None]:
+def save_ts_media(
+    st: dict, media_dir: Path, prefix: str, skip_video: bool = False
+) -> tuple[list[str], str | None, str | None]:
     """Only media_attachments on THIS status. Never attach leftover m_* from the out dir."""
     images: list[str] = []
     video_rel = None
@@ -503,7 +523,7 @@ def save_ts_media(st: dict, media_dir: Path, prefix: str) -> tuple[list[str], st
         preview = att.get("preview_url") or ""
         if kind == "video":
             dest = media_dir / f"{prefix}.mp4"
-            if url and download_fresh(url, dest, timeout=180):
+            if not skip_video and url and download_fresh(url, dest, timeout=180):
                 video_rel = f"media/{dest.name}"
             tdest = media_dir / f"{prefix}_thumb.jpg"
             if (preview or url) and download_fresh(preview or url, tdest):
@@ -521,15 +541,19 @@ def save_ts_media(st: dict, media_dir: Path, prefix: str) -> tuple[list[str], st
 
 
 def ts_avatar_variants(url: str) -> list[str]:
-    """Same-account size variants + public archive of THIS avatar URL. Never X / other DIR."""
+    """Same-account size variants + Wayback of THIS avatar URL. Never X / other DIR.
+
+    Live Truth Social CDN 403s. The dated Wayback snapshot is tried first so we
+    do not sit on the hanging `2026if_` calendar wildcard or the 403 CDN.
+    """
     if not url or is_x_avatar_url(url):
         return []
-    out = [url]
+    out: list[str] = []
+    if "static-assets-1.truthsocial.com" in url and "accounts/avatars" in url:
+        out.append("https://web.archive.org/web/20260826110355if_/" + url)
+    out.append(url)
     if "/original/" in url:
         out += [url.replace("/original/", "/small/"), url.replace("/original/", "/static/")]
-    if "static-assets-1.truthsocial.com" in url and "accounts/avatars" in url:
-        out.append("https://web.archive.org/web/2026if_/" + url)
-        out.append("https://web.archive.org/web/20260826110355if_/" + url)
     return out
 
 
@@ -544,33 +568,58 @@ def scrape_ts_account_avatar(html_text: str) -> str | None:
 def save_ts_avatar(handle: str, sid: str, primary_url: str, media_dir: Path) -> str | None:
     """Avatar for THIS Truth Social account only. Empty if CDN/archive fail — never an X photo."""
     dest = media_dir / "avatar.jpg"
+    cache = ASSETS / "ts-avatars" / f"{(handle or 'unknown').lower()}.jpg"
+    if cache.exists() and looks_like_image(cache.read_bytes()):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(cache.read_bytes())
+        return "media/avatar.jpg"
     candidates: list[str] = []
     candidates.extend(ts_avatar_variants(primary_url or ""))
     page = ts_archive_url_for(sid)
+    scrape_pages = []
     if page:
-        raw = try_get(page, timeout=25)
-        if raw:
-            found = scrape_ts_account_avatar(raw.decode("utf-8", "ignore"))
-            if found:
-                candidates.extend(ts_avatar_variants(found))
+        scrape_pages.append(page)
+    # Status pages often omit the avatar CDN URL; the archive homepage has it.
+    scrape_pages.append(TS_ARCHIVE + "/")
+    if handle:
+        scrape_pages.append(f"{TS_ARCHIVE}/user/{handle}")
+        scrape_pages.append(f"{TS_ARCHIVE}/@{handle}")
     for live in (
         f"https://truthsocial.com/@{handle}",
         f"https://truthsocial.com/@{handle}/posts/{sid}",
         f"https://truthsocial.com/@{handle}/{sid}",
     ):
-        raw = try_get(live, timeout=20)
+        scrape_pages.append(live)
+    seen_pages: set[str] = set()
+    for page_url in scrape_pages:
+        if not page_url or page_url in seen_pages:
+            continue
+        seen_pages.add(page_url)
+        raw = try_get(page_url, timeout=20)
         if not raw:
             continue
         found = scrape_ts_account_avatar(raw.decode("utf-8", "ignore"))
         if found:
             candidates.extend(ts_avatar_variants(found))
+    cache = ASSETS / "ts-avatars" / f"{(handle or 'unknown').lower()}.jpg"
     seen: set[str] = set()
     for url in candidates:
         if not url or url in seen or is_x_avatar_url(url):
             continue
+        # Live TS CDN 403s; Wayback / cache only.
+        if 'static-assets-1.truthsocial.com' in url and 'web.archive.org' not in url:
+            continue
         seen.add(url)
-        if download_fresh(url, dest):
+        if download_fresh(url, dest, timeout=30):
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_bytes(dest.read_bytes())
+            except OSError:
+                pass
             return "media/avatar.jpg"
+    if cache.exists() and looks_like_image(cache.read_bytes()):
+        dest.write_bytes(cache.read_bytes())
+        return "media/avatar.jpg"
     if dest.exists():
         try:
             dest.unlink()
@@ -597,6 +646,18 @@ def empty_post_fields() -> dict:
         "quote_avatar": None,
         "quote_badge": None,
         "quote_verify_badge": None,
+        "nest_handle": None,
+        "nest_name": None,
+        "nest_en": None,
+        "nest_zh": "",
+        "nest_verified": False,
+        "nest_verify_type": None,
+        "nest_created_at_utc": None,
+        "nest_avatar": None,
+        "nest_badge": None,
+        "nest_verify_badge": None,
+        "nest_images": [],
+        "nest_video_thumb": None,
         "video": None,
         "video_thumb": None,
     }
@@ -779,6 +840,23 @@ def fx_tweet(handle: str, sid: str) -> dict:
     return data["tweet"]
 
 
+def fx_tweet_soft(handle: str, sid: str) -> dict | None:
+    """fx_tweet that never dies. Used for the optional third (nest) layer only."""
+    if not handle or not sid:
+        return None
+    try:
+        raw = get(f"{FX}/{handle.lstrip('@')}/status/{sid}", timeout=25)
+        data = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        print(f"warn: nest lookup failed {handle}/{sid} ({e})", file=sys.stderr)
+        return None
+    tw = data.get("tweet")
+    if data.get("code") != 200 or not isinstance(tw, dict):
+        print(f"warn: nest lookup {handle}/{sid} code={data.get('code')}", file=sys.stderr)
+        return None
+    return tw
+
+
 def rel(path: Path, base: Path) -> str:
     try:
         return str(path.relative_to(base))
@@ -786,7 +864,9 @@ def rel(path: Path, base: Path) -> str:
         return str(path)
 
 
-def save_media(tw: dict, media_dir: Path, prefix: str) -> tuple[list[str], str | None, str | None]:
+def save_media(
+    tw: dict, media_dir: Path, prefix: str, skip_video: bool = False
+) -> tuple[list[str], str | None, str | None]:
     media = tw.get("media") or {}
     images: list[str] = []
     video_rel = None
@@ -800,10 +880,11 @@ def save_media(tw: dict, media_dir: Path, prefix: str) -> tuple[list[str], str |
             images.append(f"media/{dest.name}")
     if videos:
         v = videos[0]
-        mp4 = best_mp4(v)
-        dest = media_dir / f"{prefix}.mp4"
-        if mp4 and download(mp4, dest, timeout=180):
-            video_rel = f"media/{dest.name}"
+        if not skip_video:
+            mp4 = best_mp4(v)
+            dest = media_dir / f"{prefix}.mp4"
+            if mp4 and download(mp4, dest, timeout=180):
+                video_rel = f"media/{dest.name}"
         thumb_url = v.get("thumbnail_url") or v.get("thumbnail") or ""
         tdest = media_dir / f"{prefix}_thumb.jpg"
         if thumb_url and download(thumb_url, tdest):
@@ -824,6 +905,9 @@ def compact(post: dict) -> str:
     if post.get("quote_handle"):
         lines.append(f"QUOTE_HANDLE={post['quote_handle']}")
         lines.append(f"QUOTE_EN={post.get('quote_en') or ''}")
+    if post.get("nest_handle"):
+        lines.append(f"NEST_HANDLE={post['nest_handle']}")
+        lines.append(f"NEST_EN={post.get('nest_en') or ''}")
     return "\n".join(lines)
 
 
@@ -881,6 +965,22 @@ def fetch_x(handle: str, sid: str, out: Path, media_dir: Path) -> None:
         text_en = strip_media_urls(tw.get("text") or tw.get("raw_text") or "")
         inner, inner_prefix = None, "m"
 
+    # Third layer: the post the INNER post itself quotes.
+    nest = None
+    if rp:
+        # retweet: `tw` already IS the inner post, so its quote is the nest.
+        nest = tw.get("quote") if isinstance(tw.get("quote"), dict) else None
+    elif qt:
+        # quote: the embedded `qt` rarely carries its own quote — re-ask fx for
+        # the inner id. Silent downgrade to no nest if that lookup fails.
+        nest = qt.get("quote") if isinstance(qt.get("quote"), dict) else None
+        if nest is None:
+            inner_id = str(qt.get("id") or "")
+            inner_handle = (qt.get("author") or {}).get("screen_name") or ""
+            full_inner = fx_tweet_soft(inner_handle, inner_id) if inner_id else None
+            cand = (full_inner or {}).get("quote")
+            nest = cand if isinstance(cand, dict) else None
+
     avatar = None
     if outer_avatar_url and download(outer_avatar_url, media_dir / "avatar.jpg"):
         avatar = "media/avatar.jpg"
@@ -904,6 +1004,28 @@ def fetch_x(handle: str, sid: str, out: Path, media_dir: Path) -> None:
         if qavatar_url and download(qavatar_url, media_dir / "quote_avatar.jpg"):
             quote_avatar = "media/quote_avatar.jpg"
 
+    nest_handle = nest_name = nest_en = nest_avatar = None
+    nest_verified = False
+    nest_vtype = None
+    nest_created_at_utc = None
+    nest_images: list[str] = []
+    nest_video_thumb = None
+    if nest is not None:
+        na = nest.get("author") or {}
+        nest_handle = na.get("screen_name")
+        nest_name = na.get("name") or nest_handle
+        nest_en = strip_media_urls(nest.get("text") or nest.get("raw_text") or "")
+        nest_verified = verified(na)
+        nest_vtype = verify_type(na)
+        nid = str(nest.get("id") or sid)
+        ndt = parse_created(nest.get("created_at"), nid)
+        nest_created_at_utc = ndt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        navatar_url = na.get("avatar_url") or ""
+        if navatar_url and download(navatar_url, media_dir / "nest_avatar.jpg"):
+            nest_avatar = "media/nest_avatar.jpg"
+        # nest keeps only a thumbnail; never pull an mp4 for the third layer.
+        nest_images, _, nest_video_thumb = save_media(nest, media_dir, "n", skip_video=True)
+
     images, video, video_thumb = save_media(src_for_media, media_dir, inner_prefix)
     badges_by: dict[str, str] = {}
     ids = [sid]
@@ -911,6 +1033,10 @@ def fetch_x(handle: str, sid: str, out: Path, media_dir: Path) -> None:
         iid = str(inner.get("id"))
         if iid not in ids:
             ids.append(iid)
+    if nest is not None and nest.get("id"):
+        nid2 = str(nest.get("id"))
+        if nid2 not in ids:
+            ids.append(nid2)
     for tid in ids:
         syn = syndication(tid)
         if not syn:
@@ -925,6 +1051,8 @@ def fetch_x(handle: str, sid: str, out: Path, media_dir: Path) -> None:
     badge = save_badge(badges_by.get((outer_handle or "").lstrip("@").lower()), media_dir / "badge.jpg")
     qh = (quote_handle or "").lstrip("@").lower() if quote_handle else ""
     quote_badge = save_badge(badges_by.get(qh), media_dir / "quote_badge.jpg") if qh else None
+    nh = (nest_handle or "").lstrip("@").lower() if nest_handle else ""
+    nest_badge = save_badge(badges_by.get(nh), media_dir / "nest_badge.jpg") if nh else None
 
     post = {
         "id": sid,
@@ -947,17 +1075,29 @@ def fetch_x(handle: str, sid: str, out: Path, media_dir: Path) -> None:
         "quote_verified": quote_verified,
         "quote_verify_type": quote_vtype,
         "quote_created_at_utc": quote_created_at_utc,
+        "nest_handle": nest_handle,
+        "nest_name": nest_name,
+        "nest_en": nest_en,
+        "nest_zh": "",
+        "nest_verified": nest_verified,
+        "nest_verify_type": nest_vtype,
+        "nest_created_at_utc": nest_created_at_utc,
         "avatar": avatar,
         "quote_avatar": quote_avatar,
+        "nest_avatar": nest_avatar,
         "badge": badge,
         "quote_badge": quote_badge,
+        "nest_badge": nest_badge,
         "verify_badge": None,
         "quote_verify_badge": None,
+        "nest_verify_badge": None,
         "platform_logo": None,
         "link_color": LINK_COLOR["x"],
         "images": images,
         "video": video,
         "video_thumb": video_thumb,
+        "nest_images": nest_images,
+        "nest_video_thumb": nest_video_thumb,
     }
     write_post(out, post)
 
@@ -1026,6 +1166,12 @@ def fetch_truthsocial(handle: str, sid: str, out: Path, media_dir: Path) -> None
         text_en = strip_html(st.get("content"))
         inner, inner_prefix, inner_acct = None, "m", {}
 
+    # Third layer, best effort only: TS statuses sometimes carry quote.quote.
+    nest = None
+    if isinstance(inner, dict):
+        cand = inner.get("quote")
+        nest = cand if isinstance(cand, dict) else None
+
     avatar = save_ts_avatar(outer_handle or handle, sid, outer_avatar_url, media_dir)
 
     quote_handle = quote_name = quote_en = quote_avatar = None
@@ -1047,6 +1193,28 @@ def fetch_truthsocial(handle: str, sid: str, out: Path, media_dir: Path) -> None
         if qavatar_url and download(qavatar_url, media_dir / "quote_avatar.jpg"):
             quote_avatar = "media/quote_avatar.jpg"
 
+    nest_handle = nest_name = nest_en = nest_avatar = None
+    nest_verified = False
+    nest_vtype = None
+    nest_created_at_utc = None
+    nest_images: list[str] = []
+    nest_video_thumb = None
+    nest_acct: dict = {}
+    if nest is not None:
+        nest_acct = nest.get("account") if isinstance(nest.get("account"), dict) else {}
+        nest_handle = nest_acct.get("username")
+        nest_name = nest_acct.get("display_name") or nest_handle
+        nest_en = strip_html(nest.get("content"))
+        nest_verified = bool(nest_acct.get("verified"))
+        nest_vtype = "verified" if nest_verified else None
+        nid = str(nest.get("id") or sid)
+        ndt = parse_created(nest.get("created_at"), nid, "truthsocial")
+        nest_created_at_utc = ndt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        navatar_url = nest_acct.get("avatar") or nest_acct.get("avatar_static") or ""
+        if navatar_url and download_fresh(navatar_url, media_dir / "nest_avatar.jpg", timeout=30):
+            nest_avatar = "media/nest_avatar.jpg"
+        nest_images, _, nest_video_thumb = save_ts_media(nest, media_dir, "n", skip_video=True)
+
     images, video, video_thumb = save_ts_media(src_for_media, media_dir, inner_prefix)
 
     platform_logo = save_platform_logo("truthsocial", media_dir)
@@ -1054,6 +1222,8 @@ def fetch_truthsocial(handle: str, sid: str, out: Path, media_dir: Path) -> None
     quote_verify_badge = verify_badge if quote_verified else None
     badge = save_badge(ts_affiliation_url(acct), media_dir / "badge.png")
     qbadge = save_badge(ts_affiliation_url(inner_acct if inner is not None else None), media_dir / "quote_badge.png")
+    nest_verify_badge = verify_badge if nest_verified else None
+    nbadge = save_badge(ts_affiliation_url(nest_acct if nest is not None else None), media_dir / "nest_badge.png")
 
     post = {
         "id": sid,
@@ -1076,17 +1246,29 @@ def fetch_truthsocial(handle: str, sid: str, out: Path, media_dir: Path) -> None
         "quote_verified": quote_verified,
         "quote_verify_type": quote_vtype,
         "quote_created_at_utc": quote_created_at_utc,
+        "nest_handle": nest_handle,
+        "nest_name": nest_name,
+        "nest_en": nest_en,
+        "nest_zh": prev.get("nest_zh") or "",
+        "nest_verified": nest_verified,
+        "nest_verify_type": nest_vtype,
+        "nest_created_at_utc": nest_created_at_utc,
         "avatar": avatar,
         "quote_avatar": quote_avatar,
+        "nest_avatar": nest_avatar,
         "badge": badge,
         "quote_badge": qbadge,
+        "nest_badge": nbadge,
         "verify_badge": verify_badge,
         "quote_verify_badge": quote_verify_badge,
+        "nest_verify_badge": nest_verify_badge,
         "platform_logo": platform_logo,
         "link_color": LINK_COLOR["truthsocial"],
         "images": images,
         "video": video,
         "video_thumb": video_thumb,
+        "nest_images": nest_images,
+        "nest_video_thumb": nest_video_thumb,
     }
     write_post(out, post)
 
@@ -1139,6 +1321,20 @@ def media_html(post: dict, base: Path) -> str:
     return "" if len(bits) == 2 else "".join(bits)
 
 
+def nest_media_html(post: dict, base: Path) -> str:
+    """Third-layer media, drawn inside the nested box. No empty box when there is none."""
+    bits = ['<div class="nmedia">']
+    thumb = file_uri(base, post.get("nest_video_thumb"))
+    if thumb:
+        bits.append(f'<div class="vidwrap"><img src="{thumb}"/>{PLAY}</div>')
+    for p in post.get("nest_images") or []:
+        src = file_uri(base, p)
+        if src:
+            bits.append(f'<img src="{src}"/>')
+    bits.append("</div>")
+    return "" if len(bits) == 2 else "".join(bits)
+
+
 def handle_line(handle: str | None, rel: str) -> str:
     h = f"@{esc(handle)}"
     return f"{h} · {esc(rel)}" if rel else h
@@ -1165,9 +1361,13 @@ def corner_logo_html(post: dict, base: Path) -> str:
     return ""
 
 
-def verify_mark_html(post: dict, base: Path, size: int, *, quote: bool = False) -> str:
+def verify_mark_html(post: dict, base: Path, size: int, *, quote: bool = False, nest: bool = False) -> str:
     """X: official scalloped seal. TS: downloaded red check. Never paint an X-blue scallop on TS."""
-    if quote:
+    if nest:
+        verified = post.get("nest_verified")
+        vtype = post.get("nest_verify_type")
+        rel = post.get("nest_verify_badge") or post.get("verify_badge")
+    elif quote:
         verified = post.get("quote_verified")
         vtype = post.get("quote_verify_type")
         rel = post.get("quote_verify_badge") or post.get("verify_badge")
@@ -1187,6 +1387,40 @@ def verify_mark_html(post: dict, base: Path, size: int, *, quote: bool = False) 
     if plat in ("", "x", "twitter"):
         return badge_svg(size, vtype)
     return ""
+
+
+def nest_html(post: dict, base: Path) -> str:
+    """Quote-inside-the-quote card. Same visual language as .quote, one size down."""
+    if not post.get("nest_handle"):
+        return ""
+    plat = (post.get("platform") or "x").lower()
+    nav = file_uri(base, post.get("nest_avatar"))
+    nav_tag = f'<img class="nqavatar" src="{nav}" alt=""/>' if nav else ""
+    nbadge = verify_mark_html(post, base, 14, nest=True)
+    norg = org_mark_html(13, file_uri(base, post.get("nest_badge"))) if post.get("nest_badge") else ""
+    nest_local = nest_bj = ""
+    if post.get("nest_created_at_utc"):
+        ncreated = parse_created(post.get("nest_created_at_utc"), str(post.get("id") or "0"), plat)
+        nest_local = handle_time(ncreated)
+        nest_bj = beijing(ncreated)
+    nest_en = post.get("nest_en") or ""
+    nest_zh = post.get("nest_zh") or ""
+    bits = [
+        '<div class="nquote"><div class="nqtop">',
+        nav_tag,
+        f'<span class="nqname">{esc(post.get("nest_name") or post.get("nest_handle"))}</span>',
+        nbadge,
+        norg,
+        f'<span class="nqhandle">{handle_line(post.get("nest_handle"), nest_local)}</span>',
+        "</div>",
+    ]
+    if nest_en:
+        bits.append(f'<div class="nqtext">{rich_text(nest_en)}</div>')
+    if nest_zh and nest_zh != nest_en:
+        bits.append(zh_box(nest_zh, nest_bj, "zh-box nzh-box"))
+    bits.append(nest_media_html(post, base))
+    bits.append("</div>")
+    return "".join(bits)
 
 
 def build_html(post: dict, base: Path) -> str:
@@ -1244,6 +1478,7 @@ def build_html(post: dict, base: Path) -> str:
             body.append(f'<div class="qtext">{rich_text(quote_en)}</div>')
         if quote_zh and quote_zh != quote_en:
             body.append(zh_box(quote_zh, quote_bj, "zh-box qzh-box"))
+        body.append(nest_html(post, base))
         body.append(media)
         body.append("</div>")
     else:
@@ -1274,22 +1509,33 @@ def guess_h(post: dict, base: Path | None = None) -> int:
     )
     # ~26 chars/line at 17px, 24px line-height; zh boxes add extra.
     text_h = 160 + (len(text) // 22) * 26
+    # Third layer sits in a narrower box at a smaller size: fewer chars per line.
+    nest_text = (post.get("nest_en") or "") + (post.get("nest_zh") or "")
+    if post.get("nest_handle"):
+        # header row + box borders/padding + both dashed-box paddings
+        text_h += 92 + (len(nest_text) // 20) * 22
     media_h = 0
-    rels = list(post.get("images") or [])
+    # (rel paths, usable content width) — the nest box is inset twice.
+    groups: list[tuple[list[str], int]] = [
+        (list(post.get("images") or []), 542),
+        (list(post.get("nest_images") or []), 494),
+    ]
     if post.get("video_thumb"):
-        rels.append(post["video_thumb"])
-    content_w = 542
-    for rel in rels:
-        fp = (base / rel) if base else None
-        if fp and fp.exists():
-            try:
-                from PIL import Image
-                w, h = Image.open(fp).size
-                media_h += int(content_w * h / max(w, 1)) + 12
-                continue
-            except Exception:
-                pass
-        media_h += 560
+        groups[0][0].append(post["video_thumb"])
+    if post.get("nest_video_thumb"):
+        groups[1][0].append(post["nest_video_thumb"])
+    for rels, content_w in groups:
+        for rel in rels:
+            fp = (base / rel) if base else None
+            if fp and fp.exists():
+                try:
+                    from PIL import Image
+                    w, h = Image.open(fp).size
+                    media_h += int(content_w * h / max(w, 1)) + 12
+                    continue
+                except Exception:
+                    pass
+            media_h += 560
     h = 400 + text_h + media_h
     return min(max(h, 720), 20000)
 
@@ -1332,18 +1578,35 @@ def screenshot(html_path: Path, png_path: Path, height: int) -> None:
     crop_black(png_path)
 
 
-def quote_md(handle: str, en: str, zh: str) -> str:
+def _md_lines(handle: str, en: str, zh: str) -> list[str]:
+    """Handle line, then Chinese, blank line, English original — the house rule."""
     parts = [f"@{handle.lstrip('@')}"]
     en, zh = (en or "").rstrip(), (zh or "").rstrip()
-    if en:
-        parts.append(en)
     if zh and zh != en:
+        parts.append(zh)
         if en:
             parts.append("")
-        parts.append(zh)
+            parts.append(en)
+    elif en:
+        parts.append(en)
+    return "\n".join(parts).split("\n")
+
+
+def nest_md(handle: str, en: str, zh: str) -> str:
+    """Third layer: one markdown quote level deeper than the quote block."""
     out = []
-    for line in "\n".join(parts).split("\n"):
+    for line in _md_lines(handle, en, zh):
+        out.append(">> " + line if line else ">>")
+    return "\n".join(out)
+
+
+def quote_md(handle: str, en: str, zh: str, nest_block: str = "") -> str:
+    out = []
+    for line in _md_lines(handle, en, zh):
         out.append("> " + line if line else ">")
+    if nest_block:
+        out.append(">")
+        out.extend(nest_block.split("\n"))
     return "\n".join(out)
 
 
@@ -1355,7 +1618,7 @@ def own_md(en: str, zh: str) -> str:
         return en
     if not en:
         return zh
-    return f"{en}\n\n{zh}"
+    return f"{zh}\n\n{en}"
 
 
 def chat_body(post: dict) -> str:
@@ -1364,7 +1627,19 @@ def chat_body(post: dict) -> str:
     if own:
         chunks.append(own)
     if post.get("quote_handle"):
-        chunks.append(quote_md(post["quote_handle"], post.get("quote_en") or "", post.get("quote_zh") or ""))
+        nest_block = ""
+        if post.get("nest_handle"):
+            nest_block = nest_md(
+                post["nest_handle"], post.get("nest_en") or "", post.get("nest_zh") or ""
+            )
+        chunks.append(
+            quote_md(
+                post["quote_handle"],
+                post.get("quote_en") or "",
+                post.get("quote_zh") or "",
+                nest_block,
+            )
+        )
     chunks.append(f"{post.get('beijing')} UTC+8")
     chunks.append(post.get("url") or "")
     return "\n\n".join(chunks).strip() + "\n"
@@ -1380,6 +1655,8 @@ def cmd_render(args: argparse.Namespace) -> None:
         post["text_zh"] = args.text_zh
     if args.quote_zh is not None:
         post["quote_zh"] = args.quote_zh
+    if getattr(args, "nest_zh", None) is not None:
+        post["nest_zh"] = args.nest_zh
     created = parse_created(post.get("created_at_utc"), str(post.get("id") or "0"), post.get("platform") or "x")
     post["meta_en"] = meta_en(created)
     post["beijing"] = beijing(created)
@@ -1500,6 +1777,7 @@ def main() -> None:
     r.add_argument("--dir", required=True)
     r.add_argument("--text-zh")
     r.add_argument("--quote-zh")
+    r.add_argument("--nest-zh", help="Chinese for the third layer (quote inside the quote)")
     r.set_defaults(func=cmd_render)
 
     t = sub.add_parser("timeline")
